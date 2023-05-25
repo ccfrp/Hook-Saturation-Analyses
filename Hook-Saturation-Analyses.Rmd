@@ -1,0 +1,411 @@
+---
+title: "Effort Comparisons"
+author: "Rachel Brooks"
+date: "2023-05-22"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+Using the CCFRP data at the drift level, this code examines the total fishes 
+caught and total CPUE due to differences in total numbers of anglers fishing 
+per drift
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list = ls());graphics.off()
+
+library(tidyverse) # For data manipulation and summarization
+library(plotrix) #To use standard error calculation
+library(cowplot) #For grouping plots
+library(scales) #For editing axis scales
+library(vegan) #For multivariate analyses
+library(rstatix) #For running ANCOVA
+library(ggpmisc) #adding equation and r2 to figures
+library(dplyr)
+library(magrittr)
+library(reshape2)
+library(ggridges)  #length histograms
+
+alpha=0.5
+formula<-y~x
+theme_set(theme_classic(base_size=16))
+
+```
+
+Load 'Raw' formats of the data tables. These are CSV versions of the
+original CCFRP Access database tables. Column names are not changed
+until tables are imported into R.
+
+Raw drift data are used to merge fields with the Caught Fishes table -
+this allows one to see all fish ever caught, even those excluded from
+CPUE calculations.
+
+Read in raw data tables:
+
+```{r}
+#1-Trip Information table
+trip.data.raw = read.csv("Raw_Files/1-Trip Information.csv")
+
+#3-Drift Information Table
+drift.data.raw = read.csv("Raw_Files/3-Drift Information.csv", na = c("", "NA")) 
+
+#4-Caught Fishes
+fishes.caught.raw = read.csv("Raw_Files/4-Caught Fishes.csv")
+
+#Fish codes to match species code with common name
+fish.codes = read.csv("Raw_Files/Fish Species.csv")
+
+```
+
+*The next few chunks we will filter the data needed for analyses*
+
+**Filter Trip Data:**
+
+1.  Select columns of interest
+2.  Rename columns as needed
+3.  Filter out 'Areas'.
+4.  Using mutate() to convert 'Area' to a factor with the full names as
+    labels
+
+```{r}
+
+#str(trip.data.raw)
+
+trip.data = trip.data.raw %>%
+  select(c(Trip.ID, Area, Month, Day, Year.Automatic)) %>%
+  dplyr::rename(Year = Year.Automatic) %>%
+  mutate(Area = factor(Area, levels = c('TD','CM','TM','SP',
+                                        'FN','BH','AN','PL',
+                                        'BL','PB','PC','CP',
+                                        'AI','LB','SW','LJ'),
+                       labels = c('Trinidad','South Cape Mendocino','Ten Mile',
+                                  'Stewarts Point','Farallon Islands', 
+                                  'Bodega Head','Ano Nuevo', 'Point Lobos',
+                                  'Piedras Blancas','Point Buchon',
+                                  'Point Conception','Carrington Point',
+                                  'Anacapa Island','Laguna Beach',
+                                  'Swamis','South La Jolla'))) %>%
+  
+  droplevels()
+
+#DEFINE CELLS TO BE EXCLUDED FROM ANALYSIS
+
+excluded.cells = c("TDRR", "CMMM", "CMRR", "TMMM", "TMRR",
+                   "FNMM","FNRR","SPMM", "SPRR", "BHMM", "BHRR",
+                   "ANMM", "ANRR","PLMM","PLMN", "PLMO","PLRR",
+                   "BLMM", "BLRR","PBMM", "PBRR",
+                   "PCMM", "PCRR", "CPMM", "CPRR", "AIMM", "AIRR",
+                   "LBMM", "LBRR", "SWMM", "SwRR", "LJMM", "LJRR")
+
+```
+
+**Filter Drift Data:**
+
+(This should include drifts with no fish caught. This includes the
+column 'Total.Fishes.Caught' to visually verify that 0-fish drifts are
+included. This will be important for the fishing effort calculation.
+
+1.  Get rid of drifts marked for exclusion (e.g. drift outside cell,
+    overlapped with other cell, etc.)
+2.  Select columns of interest
+3.  Rename columns as needed
+4.  Merge with trip data (this is an inner-join by default and will only
+    select drifts that are contained in the filtered trip data above
+    (i.e. no need to select particular 'Areas' again)
+5.  Filter out the excluded cells
+6.  Filter any drift that was 2 min or less in length (See CCFRP SOP
+    document for this rule)
+
+```{r}
+
+drift.data = drift.data.raw %>%
+ 
+  #DROP EXCLUDED DRIFTS - NO TEXT ALLOWED IN CELL
+  filter(is.na(Excluded.Drift.Comment))%>% 
+
+  #SELECT RELEVANT COLUMNS
+  select(c(Drift.ID, Trip.ID, Grid.Cell.ID, ID.Cell.per.Trip,
+           Site..MPA..REF., Drift.Time..hrs., Total.Fishes.Caught, 
+           Total.Angler.Hrs,Total...Anglers.Fishing, Total.Fishes.Caught)) %>%   
+  
+  dplyr::rename(Site = Site..MPA..REF.,
+                Drift.Time.Hrs = Drift.Time..hrs.,
+                Total.Anglers=Total...Anglers.Fishing) %>%
+  
+  #MERGE WITH 'trip.data' TO GET TRIP LEVEL INFO ATTACHED TO EACH DRIFT
+  merge(., trip.data, by = intersect("Trip.ID", "Trip.ID")) %>%   
+  
+  filter(!Grid.Cell.ID %in% excluded.cells) %>% #DROP DATA FROM EXCLUDED CELLS
+  filter(Drift.Time.Hrs > (2/60)) %>% #FILTER DATA THAT IS GREATER THAN 2 MIN
+  
+  droplevels()
+
+```
+
+**Effort Calculation:**
+
+This calculates 'Total Angler Hours Fished' per each 'ID.Cell.per.Trip'
+field.
+
+'ID.Cell.per.Trip' is our Sample unit and is the amount of fish caught
+in a cell on a given day. This includes drifts that were greater than
+2min and did not have fish caught.
+
+We are not filtering total time just yet ('ID.Cell.per.Trip' time
+\>2hrs). We will do that after merge with data below.
+
+```{r}
+
+effort.total = drift.data %>% 
+  group_by(Area, Site, Year, Drift.ID, Total.Anglers, Total.Fishes.Caught) %>% 
+  summarise(Total.Angler.Hours = sum(Total.Angler.Hrs)) 
+#ddply needs name to be changed ('Hours' instead of 'Hrs')
+
+```
+
+**Fish Data:**
+
+'fishes.caught' data frame is the full data set of fish caught
+regardless of whether they were caught within CCFRP cells.
+
+This data set will be used for gear type comparisons, but not for CPUE.
+
+1.  Merge with raw drift data (so that no fishes are excluded)
+2.  Merge with fish.codes to get Common Names
+3.  Select columns of interest
+4.  Rename columns for later use
+
+```{r}
+
+fishes.caught.all = fishes.caught.raw %>%
+  merge(.,drift.data.raw,by = intersect('Drift.ID','Drift.ID'), all = F)%>%  
+  # 'all = F' EXCLUDES DRIFT INFORMATION FOR DRIFTS THAT DID NOT CATCH FISH
+  
+  merge(.,fish.codes,by = intersect('Species.Code','Species.Code'), all = F)%>%
+  #MERGE COMMON NAME; DROP UNUSED SPECIES CODES
+  
+  select(c(ID.Cell.per.Trip,Drift.ID,Grid.Cell.ID,Excluded.Drift.Comment,
+           Total...Anglers.Fishing, Drift.Time..hrs.,Gear.Type, Station..,
+           Species.Code, Common.Name, Length..cm.))%>% #CHOOSE COLUMNS OF INTEREST
+  
+  dplyr::rename(Exclude = Excluded.Drift.Comment,
+                Drift.time.Hrs = Drift.Time..hrs.,
+                Station = Station..,
+                Length.cm = Length..cm.,
+                Total.Anglers=Total...Anglers.Fishing)
+
+```
+
+**CPUE calculations:**
+
+We need to apply all the same filters as we did with 'drift.data'
+
+1.  Exclude fishes caught on excluded drifts
+2.  Exclude fishes caught in excluded cellS
+3.  Exclude fishes caught on drifts less than 2 minutes long
+4.  Select columns of interest for later analysis
+
+```{r}
+
+fishes.caught.cpue = fishes.caught.all %>%
+  
+  #DROP FISHES CAUGHT IN EXCLUDED DRIFTS
+  filter(is.na(Exclude)) %>% 
+  
+  #DROP FISHES CAUGHT IN EXCLUDED CELLS
+  filter( !Grid.Cell.ID %in% excluded.cells) %>%
+  
+  #DROP FISHES CAUGHT ON DRIFTS LESS THAN 2 MINUTES LONG
+  filter(Drift.time.Hrs > (2/60)) %>% 
+  
+  select(c(ID.Cell.per.Trip, Drift.ID, Grid.Cell.ID, Total.Anglers, 
+           Species.Code, Common.Name, Length.cm)) %>%
+  droplevels()
+
+```
+
+**CPUE Summary Tables:**
+
+Next we need to aggregate the data like we would in a pivot table in
+Excel
+
+1.  Use reshape package. Much like a pivot table. This is using the
+    'length' function to count fishes.
+2.  Define first species column
+3.  Next we merge the species count 'pivot-table' by 'IDCell.per.Trip'
+    with the effort data so that we can divide catch by total adjusted
+    angler hours. Here set 'all.x = T' to keep cells that we sampled but
+    did not catch any fishes. These represent entire cells that were
+    fished for enough time to be included, but caught no fish 3A. Use
+    mutate() to create a Total CPUE variable (Sum of all species) 3B.
+    Filter out ID.Cell.per.Trip's that were less than 2 Total angler
+    hours (See CCFRP SOP document)
+4.  Replace NA's with Zeros: These are the cells that did not catch
+    fishes NOTE: Ryan F. confirmed that these are valid data points
+    through 2016
+5.  Divide the counts by 'Total.Angler.Hours' to get fish/angler hour or
+    CPUE
+
+```{r}
+
+recast.counts = dcast(fishes.caught.cpue, Drift.ID + 
+                Grid.Cell.ID ~ Common.Name, length, value.var = "Species.Code")
+
+first.spp = colnames(recast.counts)[3]
+  #last.spp = colnames(recast.counts)[length(recast.counts)]
+
+Counts.per.IDcell = merge(effort.total, recast.counts, 
+                          by = intersect("Drift.ID", 
+                                         "Drift.ID"), all.x = T) %>% 
+  
+  mutate(Total = rowSums(.[which(colnames(.) == first.spp):length(.)]))
+  
+  #KEEP DATA WITH GREATER THAN 2 ANGLER HOURS
+  #filter(Total.Angler.Hours>2) 
+
+#DEFINE COLUMNS WITH SPECIES (E.G., COLUMNS BARRED SAND BASS:TOTAL)
+spp.cols = colnames(Counts.per.IDcell)[which(colnames(Counts.per.IDcell) == 
+                                      first.spp):length(Counts.per.IDcell)]
+
+#USE THESE COLUMNS TO SELECT RELEVANT DATA AND REPLACE NA's WITH 0
+Counts.per.IDcell[spp.cols] <- replace(Counts.per.IDcell[spp.cols], 
+                                       is.na(Counts.per.IDcell[spp.cols]), 0)
+
+#DIVIDE COUNTS BY EFFORT TO GET CPUE
+CPUE.per.IDcell = Counts.per.IDcell
+CPUE.per.IDcell[spp.cols] = (Counts.per.IDcell[, spp.cols]/Counts.per.IDcell
+                                                   [, "Total.Angler.Hours"])
+
+#EXPORT CPUE AS CSV FILE FOR SUMMARY FIGURES AND ANALYSIS
+write.csv(CPUE.per.IDcell, file = 'CPUE-Per-DriftID-CCFRP-2022.csv',
+                                                  row.names = FALSE)
+
+```
+
+Import CPUE data table (CPUE-Per-DriftID-CCFRP-2022.csv) derived from
+raw data tables downloaded from CCFRP Access database. Need to transform
+data into long format to calculate average CPUE for all species across
+years.
+
+```{r}
+cpue<-read.csv('CPUE-Per-DriftID-CCFRP-2022.csv')
+
+#Gather data into long format
+cpue<-cpue%>%
+  group_by(Area, Site, Year)%>%
+  gather(species, cpue,-Drift.ID,  -Area, -Site, -Year, 
+         -Total.Angler.Hours, -Total.Anglers, -Grid.Cell.ID, 
+         -Total.Fishes.Caught)
+#Filter species to include all fish species (total)
+cpue.total<-cpue%>%
+  group_by(Area, Site, Year, species)%>%
+  filter(species == "Total")
+
+#Make angler totals a factor and not numeric
+cpue.total$Total.Anglers <- as.factor(cpue.total$Total.Anglers)
+
+```
+
+Total fishes caught per drift by number of anglers on a trip:
+(1) Scatter plot - all areas data
+(2) Scatter plot - separated by area 
+(3) Box plot - all areas data
+(4) Box plot - separated by area 
+
+```{r, fig.height = 7, fig.width = 16}
+
+#Raw Scatter Plots - each point is a drift
+
+#Plot CPUE per drift by number of anglers for each sampling area
+ggplot(cpue.total, aes(x = Total.Anglers, y = Total.Fishes.Caught, color=Area))+
+  geom_point(size = 3, shape = 16) +
+  ylab('Total fishes caught per drift')+
+  xlab('Number of anglers')+
+  ggtitle('Total fishes caught per drift by number of anglers on trip - all areas combined')
+
+#Plot CPUE per drift by number of anglers for each sampling area
+ggplot(cpue.total, aes(x = Total.Anglers, y = Total.Fishes.Caught, color=Year))+
+  geom_point(size = 3, shape = 16)+
+  ylab('Total fishes caught per drift')+
+  xlab('Number of anglers')+
+  facet_wrap(~Area)+
+  ggtitle('Total fishes caught per drift by number of anglers on trip - separated by area')
+
+
+#Box Plots
+
+# Create boxplot using all drift-specific CPUE data
+ggplot(cpue.total, aes(x = Total.Anglers, y = Total.Fishes.Caught, fill = Total.Anglers)) +
+  geom_boxplot() +
+  ylab('Total fishes caught per drift') +
+  xlab('Number of anglers')+
+  ggtitle('Total fishes caught per drift by number of anglers on trip - all areas combined')
+
+# Create boxplot using all drift-specific CPUE data facet wrapping area
+ggplot(cpue.total, aes(x = Total.Anglers, y = Total.Fishes.Caught, fill = Total.Anglers)) +
+  geom_boxplot() +
+  ylab('Total fishes caught per drift') +
+  xlab('Number of anglers') +
+  facet_wrap(~ Area)+
+  ggtitle('Total fishes caught per drift by number of anglers on trip - separated by area')
+
+```
+
+Total fish CPUE per drift by number of anglers on a trip:
+(1) Scatter plot - all areas data
+(2) Scatter plot - separated by area 
+(3) Box plot - all areas data
+(4) Box plot - separated by area 
+
+```{r, fig.height = 7, fig.width = 16}
+
+#Raw Scatter Plots - each point is a drift
+
+#Plot CPUE per drift by number of anglers for each sampling area
+ggplot(cpue.total, aes(x = Total.Anglers, y = cpue, color=Area))+
+  geom_point(size = 3, shape = 16) +
+  ylab('CPUE')+
+  labs(y=expression(CPUE~(no.~angler~hr^{-1})))+
+  xlab('Number of anglers')+
+  ggtitle('Total CPUE per drift by number of anglers on trip - all areas combined')
+
+#Plot CPUE per drift by number of anglers for each sampling area
+ggplot(cpue.total, aes(x = Total.Anglers, y = cpue, color=Year))+
+  geom_point(size = 3, shape = 16)+
+  ylab('CPUE')+
+  labs(y=expression(CPUE~(no.~angler~hr^{-1})))+
+  xlab('Number of anglers')+
+  facet_wrap(~Area)+
+  ggtitle('Total CPUE per drift by number of anglers on trip - separated by area')
+
+
+#Box Plots
+
+#Make angler totals a factor and not numeric
+cpue.total$Total.Anglers <- as.factor(cpue.total$Total.Anglers)
+
+# Create boxplot using all drift-specific CPUE data
+ggplot(cpue.total, aes(x = Total.Anglers, y = cpue, fill = Total.Anglers)) +
+  geom_boxplot() +
+  ylab('CPUE') +
+  labs(y = expression(CPUE~(no.~angler~hr^{-1}))) +
+  xlab('Number of anglers')+
+  ggtitle('Total CPUE per drift by number of anglers on trip - all areas combined')
+
+# Create boxplot using all drift-specific CPUE data facet wrapping area
+ggplot(cpue.total, aes(x = Total.Anglers, y = cpue, fill = Total.Anglers)) +
+  geom_boxplot() +
+  ylab('CPUE') +
+  labs(y = expression(CPUE~(no.~angler~hr^{-1}))) +
+  xlab('Number of anglers') +
+  facet_wrap(~ Area)+
+  ggtitle('Total CPUE per drift by number of anglers on trip - separated by area')
+
+```
+
+
+```
